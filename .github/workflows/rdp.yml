@@ -1,0 +1,85 @@
+name: Rdprzyk
+run-name: ssh rdprzyk-f230ad68c2f8
+
+on:
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+jobs:
+  rdp:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 355
+    env:
+      RDP_USER: rdpc939
+      RDP_HOST: rdprzyk-f230ad68c2f8
+      GITHUB_TOKEN: ${{ github.token }}
+      RDP_PASSWORD: ${{ secrets.RDP_PASSWORD }}
+    steps:
+      - name: Membuat user Linux
+        shell: bash
+        run: |
+          echo "Membuat user Linux '$RDP_USER'"
+          sudo useradd -m -s /bin/bash "$RDP_USER"
+          printf '%s:%s\n' "$RDP_USER" "$RDP_PASSWORD" | sudo chpasswd
+          sudo usermod -aG sudo "$RDP_USER"
+          printf '%s ALL=(ALL) NOPASSWD:ALL\n' "$RDP_USER" | sudo tee "/etc/sudoers.d/90-rdprzyk" >/dev/null
+          sudo chmod 440 /etc/sudoers.d/90-rdprzyk
+          id "$RDP_USER"
+          echo 'User siap dan punya akses sudo'
+      - name: Mengaktifkan SSH
+        shell: bash
+        run: |
+          echo 'Menyiapkan SSH server'
+          if [ ! -x /usr/sbin/sshd ]; then
+            sudo apt-get update -qq
+            sudo DEBIAN_FRONTEND=noninteractive apt-get install -y -qq openssh-server
+          fi
+          sudo mkdir -p /etc/ssh/sshd_config.d /run/sshd
+          printf 'PasswordAuthentication yes\nKbdInteractiveAuthentication no\nPermitRootLogin no\nUsePAM yes\n' | sudo tee /etc/ssh/sshd_config.d/00-rdprzyk.conf >/dev/null
+          sudo systemctl restart ssh 2>/dev/null || sudo service ssh restart 2>/dev/null || sudo /usr/sbin/sshd
+          ok=0
+          for i in $(seq 1 15); do
+            if (echo > /dev/tcp/127.0.0.1/22) 2>/dev/null; then ok=1; break; fi
+            sleep 2
+          done
+          if [ "$ok" != 1 ]; then echo 'Port 22 belum mendengarkan setelah SSH dijalankan'; exit 1; fi
+          echo 'SSH aktif di port 22 (login dengan password)'
+      - name: Mengunduh bore
+        shell: bash
+        run: |
+          echo 'Mengunduh bore v0.6.0'
+          mkdir -p "$RUNNER_TEMP/bore"
+          curl -fsSL "https://github.com/ekzhang/bore/releases/download/v0.6.0/bore-v0.6.0-x86_64-unknown-linux-musl.tar.gz" | tar -xz -C "$RUNNER_TEMP/bore"
+          chmod +x "$RUNNER_TEMP/bore/bore"
+          echo 'bore terpasang'
+      - name: Membuka tunnel dan menjaga SSH tetap hidup
+        shell: bash
+        run: |
+          BORE="$RUNNER_TEMP/bore/bore"
+          LOG="$RUNNER_TEMP/bore.log"
+          echo 'Membuka tunnel TCP ke bore.pub'
+          nohup "$BORE" local 22 --to bore.pub > "$LOG" 2>&1 &
+          PID=$!
+          ADDR=""
+          for i in $(seq 1 30); do
+            sleep 2
+            if ! kill -0 "$PID" 2>/dev/null; then echo 'bore berhenti sebelum tunnel terbuka'; exit 1; fi
+            ADDR=$(grep -oE 'bore\.pub:[0-9]+' "$LOG" | head -1 || true)
+            if [ -n "$ADDR" ]; then break; fi
+          done
+          if [ -z "$ADDR" ]; then echo 'bore tidak memberi port publik'; exit 1; fi
+
+          # Alamat ditulis ke file di repo: log job tidak andal dibaca lewat API selama job masih berjalan.
+          B64=$(printf '%s' "$ADDR" | base64 -w0)
+          curl -fsS -X PUT -H "Authorization: Bearer $GITHUB_TOKEN" -H 'Accept: application/vnd.github+json' \
+            "https://api.github.com/repos/$GITHUB_REPOSITORY/contents/addr.txt" \
+            -d "{\"message\":\"addr\",\"content\":\"$B64\"}" >/dev/null || echo 'Gagal menulis addr.txt'
+
+          echo "CLOUDRDP_READY addr=$ADDR"
+
+          # Kalau bore mati, port publik hilang, jadi gagalkan job.
+          while kill -0 "$PID" 2>/dev/null; do sleep 15; done
+          echo 'bore berhenti, tunnel terputus'
+          exit 1
